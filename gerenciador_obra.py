@@ -27,7 +27,7 @@ ANEXOS_FOLDER_ID = "14leb6weZguOux5HMcaovmonLNN3kw2_M"
 
 @st.cache_resource
 def get_google_services():
-    """Autentica via OAuth2 e abre os recursos da planilha uma única vez in cache."""
+    """Autentica via OAuth2 e abre os recursos da planilha uma única vez em cache de conexão."""
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     
     try:
@@ -63,15 +63,16 @@ def get_google_services():
         
     return gc, drive_service, worksheet
 
-# Inicialização global das conexões por cache
+# Inicialização global das conexões por cache de recurso
 try:
     gc, drive_service, worksheet = get_google_services()
 except Exception as e:
     st.error(f"❌ Erro de conexão com a API do Google: {e}")
     st.stop()
 
+@st.cache_data(ttl=600)
 def load_cloud_data():
-    """Lê todas as linhas cadastradas na Planilha Google e higieniza os tipos dos dados."""
+    """Lê todas as linhas cadastradas na Planilha Google e guarda em cache por performance."""
     data = worksheet.get_all_records()
     df = pd.DataFrame(data)
     if not df.empty:
@@ -87,7 +88,9 @@ def load_cloud_data():
         ])
     return df
 
+@st.cache_data(ttl=600)
 def get_drive_files_inventory():
+    """Mapeia os anexos do Drive e armazena em cache para evitar travar a navegação."""
     try:
         query = f"'{ANEXOS_FOLDER_ID}' in parents and trashed = false"
         results = drive_service.files().list(q=query, fields="files(id, name, webViewLink)").execute()
@@ -107,9 +110,17 @@ def delete_file_from_drive(file_id):
     except: return False
 
 # --- DOMÍNIOS DE DADOS FIXOS ---
-FASES = ["1. Infraestrutura Bruta", "2. Gesso e Drywall", "3. Revestimentos e Pisos", "4. Marcenaria e Pedras", "5. Pintura e Acabamento", "6. Iluminação e Elétrica Fina"]
-COMODOS = ["Geral / Todos", "Sala de Estar", "Cozinha", "Suíte Principal", "Quarto 2", "Banheiro Social", "Varanda Gourmet"]
-STATUS_OPCOES = ["Não Iniciado", "Em Orçamento", "Orçamento Selecionado", "Contratado / Comprado", "Em Execução / Entrega", "Concluído & Pago"]
+FASES = [
+    "1. Infraestrutura Bruta", 
+    "2. Gesso e Drywall", 
+    "3. Revestimentos e Pisos", 
+    "4. Marcenaria e Pedras", 
+    "5. Pintura e Acabamento", 
+    "6. Iluminação e Elétrica Fina",
+    "7. Mobiliário e Equipamentos"
+]
+COMODOS = ["Geral / Todos", "Sala de Estar", "Cozinha", "Lavanderia", "Suíte Principal", "Quarto 2", "Banheiro Social", "Varanda Gourmet"]
+STATUS_OPCOES = ["Não Iniciado", "Em Orçamento", "Orçamento Selecionado", "Orçamento Recusado", "Contratado / Comprado", "Em Execução / Entrega", "Concluído & Pago"]
 CATEGORIAS = ["Material", "Serviço", "Material/Serviço"]
 MEIOS_PAGAMENTO = ["Pix", "Cartão de Crédito", "Boleto"]
 CONDICOES_PAGAMENTO = ["À vista", "Parcelado"]
@@ -127,7 +138,7 @@ for f in lista_arquivos_drive:
             arquivos_contagem[parts[1]] = arquivos_contagem.get(parts[1], 0) + 1
 
 df_original['custo_atual_projetado'] = df_original.apply(
-    lambda r: r['valor_real'] if r['status'] in ["Contratado / Comprado", "Em Execução / Entrega", "Concluído & Pago"] and r['valor_real'] > 0 else r['valor_estimado'], 
+    lambda r: r['valor_real'] if r['status'] in ["Orçamento Selecionado", "Contratado / Comprado", "Em Execução / Entrega", "Concluído & Pago"] and r['valor_real'] > 0 else r['valor_estimado'], 
     axis=1
 )
 
@@ -141,7 +152,7 @@ opcoes_meses = sorted(df_original['mes_venc_filtro'].dropna().unique())
 # --- INTERFACE VISUAL ---
 st.markdown('<h2 style="color:#1E3A8A; margin-bottom: 5px;">🚧 Gestor de Obra & Suprimentos Cloud</h2>', unsafe_allow_html=True)
 
-# PROCESSAMENTO PRÉVIO DE FILTROS PARA KPIs DINÂMICOS
+# PROCESSAMENTO PRÉVIO DE FILTROS
 if 'filtro_fase_sel' not in st.session_state: st.session_state.filtro_fase_sel = []
 if 'filtro_comodo_sel' not in st.session_state: st.session_state.filtro_comodo_sel = []
 if 'filtro_cat_sel' not in st.session_state: st.session_state.filtro_cat_sel = []
@@ -155,14 +166,29 @@ if st.session_state.filtro_cat_sel: df_filtrado = df_filtrado[df_filtrado['categ
 if st.session_state.filtro_status_sel: df_filtrado = df_filtrado[df_filtrado['status'].isin(st.session_state.filtro_status_sel)]
 if st.session_state.filtro_venc_sel: df_filtrado = df_filtrado[df_filtrado['mes_venc_filtro'].isin(st.session_state.filtro_venc_sel)]
 
+# ALGORITMO DE DEDUPLICAÇÃO DE ORÇAMENTOS PARA KPIs
+df_limpo_calculo = df_filtrado[df_filtrado['status'] != "Orçamento Recusado"].copy()
+
+def filtrar_melhor_opcao_orcamento(group):
+    status_vencedores = ["Orçamento Selecionado", "Contratado / Comprado", "Em Execução / Entrega", "Concluído & Pago"]
+    vencedores = group[group['status'].isin(status_vencedores)]
+    if not vencedores.empty:
+        return vencedores.head(1)
+    return group.sort_values(by='custo_atual_projetado').head(1)
+
+if not df_limpo_calculo.empty:
+    df_kpi = df_limpo_calculo.groupby(['item', 'comodo'], as_index=False).apply(filtrar_melhor_opcao_orcamento).reset_index(drop=True)
+else:
+    df_kpi = df_limpo_calculo.copy()
+
 # INDICADORES GLOBAIS COMPACTOS
 kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-total_orcado = df_filtrado['valor_estimado'].sum()
-total_comprometido = df_filtrado[df_filtrado['status'].isin(['Contratado / Comprado', 'Em Execução / Entrega', 'Concluído & Pago'])]['valor_real'].sum()
-total_projetado = df_filtrado['custo_atual_projetado'].sum()
+total_orcado = df_kpi['valor_estimado'].sum()
+total_comprometido = df_kpi[df_kpi['status'].isin(['Contratado / Comprado', 'Em Execução / Entrega', 'Concluído & Pago'])]['valor_real'].sum()
+total_projetado = df_kpi['custo_atual_projetado'].sum()
 
-total_itens = len(df_filtrado)
-itens_concluidos = len(df_filtrado[df_filtrado['status'] == "Concluído & Pago"])
+total_itens = len(df_kpi)
+itens_concluidos = len(df_kpi[df_kpi['status'] == "Concluído & Pago"])
 pct_progresso = (itens_concluidos / total_itens * 100) if total_itens > 0 else 0.0
 
 desvio = total_projetado - total_orcado
@@ -212,6 +238,7 @@ if st.session_state.get("abrir_modal", False):
                 except: novo_id = "1"
                 worksheet.append_row([str(novo_id), str(novo_item), str(nova_fase), str(novo_comodo), str(nova_cat), str(novo_status), float(val_est), str(val_real), str(fornec), datetime.today().strftime('%Y-%m-%d'), str(dt_venc_raw.strftime('%Y-%m-%d')), str(meio_p), str(condicao_p), int(1 if condicao_p == "À vista" else qtd_p), ""], value_input_option="USER_ENTERED")
                 st.session_state.abrir_modal = False
+                st.cache_data.clear()
                 st.rerun()
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -235,11 +262,12 @@ with tab_matriz:
         colunas_ordenadas = ["Selec.", "id", "item", "fase", "comodo", "categoria", "status", "valor_estimado", "valor_real", "fornecedor", "data_vencimento", "meio_pagamento", "condicao_pagamento", "qtd_parcelas", "Anexos", "data_atualizacao"]
         df_editor = df_editor[colunas_ordenadas]
 
+        # 🎯 MUDANÇA PARA TRATAMENTO DE ORDENAÇÃO INTERATIVA DE ALTA PERFORMANCE (num_rows="fixed")
         edited_df = st.data_editor(
             df_editor,
             column_config={
                 "Selec.": st.column_config.CheckboxColumn("📍", default=False, width=25),
-                "id": st.column_config.NumberColumn("ID", disabled=True, width=25),
+                "id": None, # Continua ocultado visualmente, preservado internamente
                 "item": st.column_config.TextColumn("Item / Atividade", required=True, width=180),
                 "fase": st.column_config.SelectboxColumn("Fase da Obra", options=FASES, required=True, width=185),
                 "comodo": st.column_config.SelectboxColumn("Cômodo", options=COMODOS, required=True, width=120),
@@ -255,7 +283,10 @@ with tab_matriz:
                 "Anexos": st.column_config.TextColumn("Docs", disabled=True, width=40),
                 "data_atualizacao": st.column_config.TextColumn("Modificado", disabled=True, width=60)
             },
-            hide_index=True, num_rows="dynamic", use_container_width=True, key="matriz_editor"
+            hide_index=True, 
+            num_rows="fixed", # 🔓 O SEGREDO DO DESBLOQUEIO ESTÁ AQUI! Ativa a ordenação nativa por clique no cabeçalho.
+            use_container_width=True, 
+            key="matriz_editor"
         )
         
         linhas_selecionadas_existentes = edited_df[edited_df['Selec.'] == True] if 'Selec.' in edited_df.columns else pd.DataFrame()
@@ -272,9 +303,9 @@ with tab_matriz:
                 linhas_restantes = edited_df[edited_df['Selec.'] == False]
                 worksheet.clear()
                 worksheet.append_row(["id", "item", "fase", "comodo", "categoria", "status", "valor_estimado", "valor_real", "fornecedor", "data_atualizacao", "data_vencimento", "meio_pagamento", "condicao_pagamento", "qtd_parcelas", "arquivo_url"])
-                # 🎯 CORREÇÃO DO BUG: r.get('data_vencimento') mapeado corretamente para evitar replicação de dados fantasmas
                 novas_linhas = [[str(r['id']), str(r.get('item', 'Novo Item')), str(r.get('fase', FASES[0])), str(r.get('comodo', COMODOS[0])), str(r.get('categoria', CATEGORIAS[0])), str(r.get('status', STATUS_OPCOES[0])), str(r.get('valor_estimado', 0.0)), str(r.get('valor_real', 0.0)), str(r.get('fornecedor', '')), datetime.today().strftime('%Y-%m-%d'), r.get('data_vencimento').strftime('%Y-%m-%d') if pd.notna(r.get('data_vencimento')) else datetime.today().strftime('%Y-%m-%d'), str(r.get('meio_pagamento', 'Pix')), str(r.get('condicao_pagamento', 'À vista')), str(r.get('qtd_parcelas', 1)), ""] for _, r in linhas_restantes.iterrows()]
                 if novas_linhas: worksheet.append_rows(novas_linhas, value_input_option="USER_ENTERED")
+                st.cache_data.clear()
                 st.rerun()
 
         if btn_duplicar_linhas:
@@ -293,6 +324,7 @@ with tab_matriz:
                 worksheet.append_row(["id", "item", "fase", "comodo", "categoria", "status", "valor_estimado", "valor_real", "fornecedor", "data_atualizacao", "data_vencimento", "meio_pagamento", "condicao_pagamento", "qtd_parcelas", "arquivo_url"])
                 novas_linhas = [[str(r['id']), str(r.get('item', 'Novo Item')), str(r.get('fase', FASES[0])), str(r.get('comodo', COMODOS[0])), str(r.get('categoria', CATEGORIAS[0])), str(r.get('status', STATUS_OPCOES[0])), str(r.get('valor_estimado', 0.0)), str(r.get('valor_real', 0.0)), str(r.get('fornecedor', '')), datetime.today().strftime('%Y-%m-%d'), r.get('data_vencimento').strftime('%Y-%m-%d') if pd.notna(r.get('data_vencimento')) else datetime.today().strftime('%Y-%m-%d'), str(r.get('meio_pagamento', 'Pix')), str(r.get('condicao_pagamento', 'À vista')), str(r.get('qtd_parcelas', 1)), ""] for _, r in dataset_completo.iterrows()]
                 if novas_linhas: worksheet.append_rows(novas_linhas, value_input_option="USER_ENTERED")
+                st.cache_data.clear()
                 st.rerun()
 
         if btn_salvar_geral:
@@ -303,6 +335,7 @@ with tab_matriz:
                 if novas_linhas: worksheet.append_rows(novas_linhas, value_input_option="USER_ENTERED")
                 st.success("🔒 Sincronizado!")
                 time.sleep(0.5)
+                st.cache_data.clear()
                 st.rerun()
     else: st.info("Nenhum registro encontrado correspondente aos filtros.")
 
@@ -324,6 +357,7 @@ with tab_arquivos:
                 upload_file_to_drive(arquivo_anexado, f"ID_{id_item_upload}_{arquivo_anexado.name.replace('_', '-')}")
                 st.success("🎉 Arquivo salvo!")
                 time.sleep(0.5)
+                st.cache_data.clear()
                 st.rerun()
 
     st.markdown("---")
@@ -333,18 +367,21 @@ with tab_arquivos:
             col_nome_arq.write(f"📄 {arq['name'].replace(f'ID_{id_item_upload}_', '')}")
             col_btn_open.markdown(f"[🔗 Abrir Documento]({arq['webViewLink']})")
             if col_btn_del.button("🗑️ Deletar", key=f"del_{arq['id']}", type="secondary"):
-                if delete_file_from_drive(arq['id']): st.rerun()
+                if delete_file_from_drive(arq['id']): 
+                    st.cache_data.clear()
+                    st.rerun()
     else: st.info("ℹ️ Nenhum arquivo anexado a este item.")
 
 # === ABA 3: DASHBOARD FINANCEIRO ===
 with tab_dashboard:
     st.markdown("##### 🗓️ Cronograma de Desembolso Mensal (Fluxo de Caixa Diluído por Parcelas)")
     linhas_fluxo_calculado = []
-    for _, row in df_filtrado.iterrows():
+    
+    for _, row in df_kpi.iterrows():
         custo_item = row['custo_atual_projetado']
         try: dt_base = pd.to_datetime(row['data_vencimento'])
         except: dt_base = pd.to_datetime(datetime.today().strftime('%Y-%m-%d'))
-        n_parcelas = int(row['qtd_parcelas']) if row['qtd_parcelas'] > 0 else 1
+        n_parcelas = int(row['qtd_parcelas']) if row['qtd_parcelas'] > 1 else 1
         
         if row['condicao_pagamento'] == "Parcelado" and n_parcelas > 1:
             for i in range(n_parcelas):
